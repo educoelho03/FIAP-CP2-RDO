@@ -1,0 +1,204 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <inttypes.h>  // Para PRIu32
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/event_groups.h"
+
+#include "esp_system.h"
+#include "esp_task_wdt.h"
+
+#define AUTHOR_TAG "{Eduardo Paiva Coelho-RM:89235}"
+
+// ----- Configurações -----
+#define QUEUE_LENGTH        10
+#define QUEUE_ITEM_SIZE     sizeof(int)
+
+#define GENERATOR_PERIOD_MS 200
+#define RECEIVER_WAIT_MS    500
+#define RECEIVER_WARNING_THRESHOLD 3
+#define RECEIVER_RECOVERY_THRESHOLD 6
+#define RECEIVER_SHUTDOWN_THRESHOLD 9
+#define SUPERVISOR_PERIOD_MS 1000
+#define WDT_TIMEOUT_S 10
+
+#define FLAG_GEN_OK   (1 << 0)
+#define FLAG_REC_OK   (1 << 1)
+#define FLAG_GEN_WARN (1 << 2)
+#define FLAG_REC_WARN (1 << 3)
+
+static QueueHandle_t data_queue = NULL;
+static EventGroupHandle_t status_events = NULL;
+
+static volatile uint32_t gen_count = 0;
+static volatile uint32_t gen_discarded = 0;
+static volatile uint32_t rec_count = 0;
+
+static void *safe_malloc(size_t s) {
+    void *p = malloc(s);
+    if (p == NULL) {
+        printf("%s [MEM] malloc failed for %u bytes\n", AUTHOR_TAG, (unsigned)s);
+    }
+    return p;
+}
+
+void generator_task(void *arg) {
+    int value = 0;
+    TickType_t period = pdMS_TO_TICKS(GENERATOR_PERIOD_MS);
+    while (1) {
+        value = (int)__atomic_add_fetch(&gen_count, 1, __ATOMIC_RELAXED);
+        BaseType_t res = xQueueSend(data_queue, &value, 0);
+        if (res == pdTRUE) {
+            printf("%s [FILA] Dado enviado com sucesso! Valor=%d\n", AUTHOR_TAG, value);
+            xEventGroupSetBits(status_events, FLAG_GEN_OK);
+            xEventGroupClearBits(status_events, FLAG_GEN_WARN);
+        } else {
+            __atomic_add_fetch(&gen_discarded, 1, __ATOMIC_RELAXED);
+            printf("%s [FILA] Fila cheia, valor %d descartado\n", AUTHOR_TAG, value);
+            xEventGroupSetBits(status_events, FLAG_GEN_OK | FLAG_GEN_WARN);
+        }
+        esp_task_wdt_reset();
+        vTaskDelay(period);
+    }
+}
+
+void receiver_task(void *arg) {
+    const TickType_t wait_ticks = pdMS_TO_TICKS(RECEIVER_WAIT_MS);
+    int *pval = NULL;
+    int consecutive_timeouts = 0;
+
+    while (1) {
+        pval = (int*) safe_malloc(sizeof(int));
+        if (pval == NULL) {
+            printf("%s [REC] Falha de alocação de memória\n", AUTHOR_TAG);
+            xEventGroupClearBits(status_events, FLAG_REC_OK);
+            xEventGroupSetBits(status_events, FLAG_REC_WARN);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        BaseType_t got = xQueueReceive(data_queue, pval, wait_ticks);
+        if (got == pdTRUE) {
+            consecutive_timeouts = 0;
+            printf("%s [TRANSMISSAO] Valor recebido e exibido: %d\n", AUTHOR_TAG, *pval);
+            __atomic_add_fetch(&rec_count, 1, __ATOMIC_RELAXED);
+            xEventGroupSetBits(status_events, FLAG_REC_OK);
+            xEventGroupClearBits(status_events, FLAG_REC_WARN);
+            free(pval);
+            pval = NULL;
+        } else {
+            free(pval);
+            pval = NULL;
+            consecutive_timeouts++;
+            printf("%s [REC] Nenhum dado recebido (%d timeouts)\n", AUTHOR_TAG, consecutive_timeouts);
+            xEventGroupClearBits(status_events, FLAG_REC_OK);
+            xEventGroupSetBits(status_events, FLAG_REC_WARN);
+
+            if (consecutive_timeouts == RECEIVER_WARNING_THRESHOLD) {
+                printf("%s [REC] Aviso: atrasos consecutivos na recepção\n", AUTHOR_TAG);
+            } else if (consecutive_timeouts == RECEIVER_RECOVERY_THRESHOLD) {
+                printf("%s [REC] Tentando recuperação: limpando fila\n", AUTHOR_TAG);
+                xQueueReset(data_queue);
+                vTaskDelay(pdMS_TO_TICKS(200));
+            } else if (consecutive_timeouts >= RECEIVER_SHUTDOWN_THRESHOLD) {
+                printf("%s [REC] Limite de falhas atingido. Encerrando tarefa de recepção.\n", AUTHOR_TAG);
+                xEventGroupClearBits(status_events, FLAG_REC_OK);
+                xEventGroupSetBits(status_events, FLAG_REC_WARN);
+                while (1) {
+                    printf("%s [REC] Travado - aguardando watchdog\n", AUTHOR_TAG);
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                }
+            }
+        }
+        esp_task_wdt_reset();
+    }
+}
+
+void supervisor_task(void *arg) {
+    const TickType_t period = pdMS_TO_TICKS(SUPERVISOR_PERIOD_MS);
+    EventBits_t bits;
+
+    while (1) {
+        bits = xEventGroupGetBits(status_events);
+        bool gen_ok = (bits & FLAG_GEN_OK) != 0;
+        bool rec_ok = (bits & FLAG_REC_OK) != 0;
+        bool gen_warn = (bits & FLAG_GEN_WARN) != 0;
+        bool rec_warn = (bits & FLAG_REC_WARN) != 0;
+
+        printf("%s [SUP] Status - Gen: %s%s | Rec: %s%s | Stats: G=%" PRIu32 " D=%" PRIu32 " R=%" PRIu32 "\n",
+               AUTHOR_TAG,
+               gen_ok ? "OK" : "NOT_OK",
+               gen_warn ? " (WARN)" : "",
+               rec_ok ? "OK" : "NOT_OK",
+               rec_warn ? " (WARN)" : "",
+               gen_count, gen_discarded, rec_count);
+
+        if (!gen_ok || !rec_ok) {
+            printf("%s [SUP] Detecção de falha. Tentando recuperação...\n", AUTHOR_TAG);
+            xEventGroupClearBits(status_events, FLAG_GEN_WARN | FLAG_REC_WARN);
+            static int fail_counter = 0;
+            if (!rec_ok) {
+                fail_counter++;
+                if (fail_counter > 5) {
+                    printf("%s [SUP] Reiniciando sistema devido a falhas persistentes.\n", AUTHOR_TAG);
+                    esp_restart();
+                }
+            } else {
+                fail_counter = 0;
+            }
+        }
+
+        esp_task_wdt_reset();
+        xEventGroupClearBits(status_events, FLAG_GEN_OK | FLAG_REC_OK);
+        vTaskDelay(period);
+    }
+}
+
+void app_main(void) {
+    printf("%s [SYS] Inicializando sistema multitarefa\n", AUTHOR_TAG);
+
+    data_queue = xQueueCreate(QUEUE_LENGTH, QUEUE_ITEM_SIZE);
+    if (!data_queue) {
+        printf("%s [SYS] Falha ao criar fila\n", AUTHOR_TAG);
+        return;
+    }
+
+    status_events = xEventGroupCreate();
+    if (!status_events) {
+        printf("%s [SYS] Falha ao criar grupo de eventos\n", AUTHOR_TAG);
+        return;
+    }
+
+    esp_task_wdt_config_t config = {
+        .timeout_ms = WDT_TIMEOUT_S * 1000,
+        .trigger_panic = true
+    };
+
+    esp_err_t err = esp_task_wdt_init(&config);
+    if (err == ESP_ERR_INVALID_STATE) {
+        printf("%s [WDT] Watchdog já inicializado\n", AUTHOR_TAG);
+    } else if (err != ESP_OK) {
+        printf("%s [WDT] Erro ao inicializar WDT: %d\n", AUTHOR_TAG, err);
+    } else {
+        printf("%s [WDT] Watchdog inicializado (%d s)\n", AUTHOR_TAG, WDT_TIMEOUT_S);
+    }
+
+    TaskHandle_t gen_handle = NULL;
+    xTaskCreatePinnedToCore(generator_task, "generator", 4096, NULL, 3, &gen_handle, tskNO_AFFINITY);
+    if (gen_handle) esp_task_wdt_add(gen_handle);
+
+    TaskHandle_t rec_handle = NULL;
+    xTaskCreatePinnedToCore(receiver_task, "receiver", 6144, NULL, 3, &rec_handle, tskNO_AFFINITY);
+    if (rec_handle) esp_task_wdt_add(rec_handle);
+
+    TaskHandle_t sup_handle = NULL;
+    xTaskCreatePinnedToCore(supervisor_task, "supervisor", 4096, NULL, 2, &sup_handle, tskNO_AFFINITY);
+    if (sup_handle) esp_task_wdt_add(sup_handle);
+
+    printf("%s [SYS] Tarefas criadas com sucesso. Sistema em execução.\n", AUTHOR_TAG);
+}
